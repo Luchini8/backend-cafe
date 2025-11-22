@@ -1,218 +1,199 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-from PIL import Image
-import io
-import numpy as np
 import cv2
-from typing import List, Dict
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from ultralytics import YOLO
+from collections import Counter
+from typing import List, Dict, Any
 
-# Inicializar FastAPI
-app = FastAPI(title="Coffee Cherry Detection API")
+app = FastAPI(title="Coffee Bean Detection API (OpenCV Optimized)")
 
-# Configurar CORS para permitir peticiones desde Flutter
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # En producción, especifica el dominio de tu app
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------------------------------------
+# CONFIGURACIÓN GLOBAL
+# ---------------------------------------------------------
+MODEL_PATH = "best.pt"  # Asegúrate de que este archivo exista en el directorio
+try:
+    # Cargamos el modelo al iniciar
+    model = YOLO(MODEL_PATH)
+except Exception as e:
+    print(f"ERROR CRÍTICO: No se pudo cargar el modelo en {MODEL_PATH}. {e}")
+    model = None
 
-# Cargar modelo YOLOv8n-seg al iniciar
-print("Cargando modelo YOLOv8n-seg...")
-model = YOLO("best.pt")
-print("✅ Modelo cargado exitosamente")
+# Umbrales definidos en los requerimientos
+CONF_THRESHOLD = 0.10
+IOU_BOX_THRESHOLD = 0.5
+IOU_MASK_THRESHOLD = 0.1
 
-# Mapeo de clases
-CLASS_NAMES = {
-    0: "maduro",
-    1: "pinton",
-    2: "seco",
-    3: "sobremaduro",
-    4: "verde"
-}
+# ---------------------------------------------------------
+# UTILIDADES DE FILTRADO (NMS & IOU)
+# ---------------------------------------------------------
 
-# Configuración de umbrales (replicando el código de Colab)
-CONF_THRESHOLD = 0.10  # Umbral de confianza mínimo para MOSTRAR una predicción
-IOU_BBOX_THRESHOLD = 0.5  # Umbral IoU para NMS interno basado en BBox
-MASK_IOU_THRESHOLD = 0.1  # Umbral IoU para NMS basado en máscaras
-
-
-# --- Funciones auxiliares para NMS basado en máscaras ---
-def calculate_mask_iou(mask1_coords, mask2_coords, img_shape):
-    """Calcula IoU entre dos máscaras basándose en sus coordenadas de polígono"""
-    mask1_img = np.zeros(img_shape[:2], dtype=np.uint8)
-    mask2_img = np.zeros(img_shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask1_img, [mask1_coords.astype(np.int32)], 1)
-    cv2.fillPoly(mask2_img, [mask2_coords.astype(np.int32)], 1)
-    intersection = np.logical_and(mask1_img, mask2_img).sum()
-    union = np.logical_or(mask1_img, mask2_img).sum()
+def calculate_mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """
+    Calcula la Intersección sobre Unión (IoU) de dos máscaras binarias.
+    """
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
     if union == 0:
         return 0.0
     return intersection / union
 
+def polygon_to_mask(polygon, img_shape):
+    """
+    Convierte coordenadas de polígono a una máscara binaria (bitmap).
+    """
+    mask = np.zeros(img_shape[:2], dtype=np.uint8)
+    # Convertir polígono a formato entero para cv2.fillPoly
+    pts = np.array(polygon, dtype=np.int32)
+    cv2.fillPoly(mask, [pts], 1)
+    return mask.astype(bool)
 
-def apply_mask_nms(detections, img_shape, iou_threshold):
-    """Aplica Non-Maximum Suppression basado en IoU de máscaras"""
+def apply_mask_nms(detections: List[Dict], iou_thresh: float, img_shape: tuple) -> List[Dict]:
+    """
+    Aplica Non-Maximum Suppression basado en la superposición de Máscaras.
+    Prioriza detecciones con mayor confianza.
+    """
     if not detections:
         return []
-    
+
     # Ordenar por confianza descendente
     detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
-    keep_indices = []
-    suppressed = np.zeros(len(detections), dtype=bool)
+    keep = []
     
-    for i in range(len(detections)):
-        if suppressed[i]:
-            continue
-        keep_indices.append(i)
+    # Cache de máscaras binarias para evitar regenerarlas
+    mask_cache = {}
+
+    for i, current_det in enumerate(detections):
+        current_poly = current_det['polygon']
         
-        # Suprimir detecciones con alto IoU con esta detección
-        for j in range(i + 1, len(detections)):
-            if suppressed[j]:
-                continue
-            iou = calculate_mask_iou(
-                detections[i]['mask_coords'],
-                detections[j]['mask_coords'],
-                img_shape
-            )
-            if iou >= iou_threshold:
-                suppressed[j] = True
-    
-    final_detections = [detections[idx] for idx in keep_indices]
-    return final_detections
+        # Generar o recuperar máscara
+        if i not in mask_cache:
+            mask_cache[i] = polygon_to_mask(current_poly, img_shape)
+        
+        curr_mask = mask_cache[i]
+        should_keep = True
 
+        for j in keep:
+            # Recuperar máscara de la detección ya aceptada
+            prev_mask = mask_cache[j['original_index']]
+            
+            # Calcular IoU
+            iou = calculate_mask_iou(curr_mask, prev_mask)
+            
+            if iou > iou_thresh:
+                should_keep = False
+                break
+        
+        if should_keep:
+            # Guardamos el índice original para referencia en caché
+            current_det['original_index'] = i
+            keep.append(current_det)
 
-@app.get("/")
-async def root():
-    """Endpoint de prueba"""
-    return {
-        "message": "Coffee Cherry Detection API",
-        "status": "online",
-        "model": "YOLOv8n-seg",
-        "classes": CLASS_NAMES
-    }
+    # Limpiar campo temporal
+    for item in keep:
+        del item['original_index']
+        
+    return keep
 
+# ---------------------------------------------------------
+# ENDPOINTS
+# ---------------------------------------------------------
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    """
-    Recibe imagen comprimida y devuelve JSON optimizado con:
-    - Coordenadas de polígonos de segmentación
-    - Clases y confianzas
-    - Conteo por clase
-    
-    Replica la lógica exacta del código de Colab con NMS basado en máscaras
-    """
+    if model is None:
+        raise HTTPException(status_code=500, detail="Modelo no cargado.")
+
     try:
-        # Leer imagen desde el archivo subido
-        image_bytes = await file.read()
-        image = Image.open(io.BytesIO(image_bytes))
+        # 1. CAMBIO A OPENCV PURO (Lectura de bytes directa)
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
         
-        # Convertir a numpy array (OpenCV format)
-        image_np = np.array(image)
-        if len(image_np.shape) == 2:  # Grayscale
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2BGR)
-        elif image_np.shape[2] == 4:  # RGBA
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2BGR)
-        else:  # RGB
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        # Decodificar directamente a BGR (OpenCV default)
+        # Esto es CRÍTICO para coincidir con el entrenamiento si se usó cv2
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
-        img_shape = image_np.shape
-        
-        # --- PASO 1: Predicción inicial con conf muy bajo (como en Colab) ---
-        # conf=0.01 para capturar candidatos, iou=0.5 para NMS de BBox
-        results = model.predict(image_np, conf=0.01, iou=IOU_BBOX_THRESHOLD, verbose=False)
-        result = results[0]
-        
-        # --- PASO 2: Recopilar detecciones y filtrar por confianza >= 0.10 ---
+        if img is None:
+            raise HTTPException(status_code=400, detail="El archivo no es una imagen válida.")
+
+        height, width = img.shape[:2]
+
+        # 2. INFERENCIA
+        # Ultralytics maneja la conversión interna, pero al pasar numpy BGR,
+        # respetará los canales si el modelo fue entrenado así o estandarizado.
+        results = model.predict(
+            source=img, 
+            conf=CONF_THRESHOLD, 
+            iou=IOU_BOX_THRESHOLD,
+            retina_masks=True # Mejora la calidad de los polígonos
+        )[0]
+
         raw_detections = []
+
+        # Verificar si hay máscaras detectadas
+        if results.masks is not None:
+            # Extraer datos
+            # results.masks.xy devuelve una lista de arrays con coordenadas de polígonos
+            polygons = results.masks.xy 
+            boxes = results.boxes
+            names = results.names
+
+            for i, poly in enumerate(polygons):
+                # Si el polígono está vacío o muy pequeño, saltar
+                if len(poly) < 3: 
+                    continue
+
+                cls_id = int(boxes.cls[i].item())
+                conf = float(boxes.conf[i].item())
+                label = names[cls_id]
+
+                raw_detections.append({
+                    "class": label,
+                    "confidence": round(conf, 4),
+                    "polygon": poly.tolist() # Convertir numpy array a lista para JSON
+                })
+
+        # 3. FILTRADO (Mask NMS)
+        # Mantenemos la lógica de filtrar duplicados que se solapan físicamente
+        final_detections = apply_mask_nms(raw_detections, IOU_MASK_THRESHOLD, (height, width))
+
+        # 4. CÁLCULO DE ESTADÍSTICAS MEJORADAS
+        total_count = len(final_detections)
+        avg_conf = 0.0
         
-        if result.masks is not None and result.boxes is not None:
-            for i in range(len(result.boxes)):
-                confidence = float(result.boxes.conf[i])
-                
-                # Filtrado inicial por confianza (como en Colab)
-                if confidence >= CONF_THRESHOLD:
-                    cls_id = int(result.boxes.cls[i])
-                    
-                    # Asegurar que hay máscara para esta detección
-                    if i < len(result.masks.xy):
-                        bbox = result.boxes.xyxy[i].cpu().numpy().astype(int)
-                        mask_coords = result.masks.xy[i].astype(int)
-                        
-                        raw_detections.append({
-                            'confidence': confidence,
-                            'cls_id': cls_id,
-                            'class_name': CLASS_NAMES[cls_id],
-                            'bbox': bbox,
-                            'mask_coords': mask_coords
-                        })
+        # Conteo de clases
+        class_counts_raw = Counter(d['class'] for d in final_detections)
         
-        # --- PASO 3: Aplicar NMS basado en IoU de máscaras (como en Colab) ---
-        final_detections = apply_mask_nms(raw_detections, img_shape, MASK_IOU_THRESHOLD)
-        
-        # --- PASO 4: Preparar respuesta optimizada ---
-        detections = []
-        class_counts = {name: 0 for name in CLASS_NAMES.values()}
-        
-        for det in final_detections:
-            class_id = det['cls_id']
-            class_name = det['class_name']
-            confidence = det['confidence']
-            mask_coords = det['mask_coords']
-            bbox = det['bbox']
-            
-            # Incrementar contador de clase
-            class_counts[class_name] += 1
-            
-            # Convertir coordenadas de máscara a lista para JSON
-            polygon = [[float(x), float(y)] for x, y in mask_coords]
-            
-            # Añadir detección (JSON compacto)
-            detections.append({
-                "class_id": class_id,
-                "class": class_name,
-                "confidence": round(confidence, 3),
-                "polygon": [[round(x, 1), round(y, 1)] for x, y in polygon],
-                "bbox": [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
-            })
-        
-        # Calcular estadísticas
-        total_detections = len(detections)
-        avg_confidence = round(
-            sum(d["confidence"] for d in detections) / total_detections, 3
-        ) if total_detections > 0 else 0.0
-        
-        # Respuesta final optimizada
-        response = {
+        # Ordenar conteos de MAYOR a MENOR
+        sorted_class_counts = dict(sorted(class_counts_raw.items(), key=lambda item: item[1], reverse=True))
+
+        # Calcular porcentajes ordenados
+        class_percentages = {}
+        if total_count > 0:
+            avg_conf = sum(d['confidence'] for d in final_detections) / total_count
+            for cls_name, count in sorted_class_counts.items():
+                percent = (count / total_count) * 100
+                class_percentages[cls_name] = f"{percent:.1f}%"
+
+        # 5. RESPUESTA JSON
+        return JSONResponse(content={
             "success": True,
-            "image_size": {
-                "width": image.width,
-                "height": image.height
-            },
-            "total_detections": total_detections,
-            "avg_confidence": avg_confidence,
-            "class_counts": class_counts,
-            "detections": detections
-        }
-        
-        return response
-        
+            "total_detections": total_count,
+            "avg_confidence": round(avg_conf, 4),
+            "class_counts": sorted_class_counts,     # Requerimiento: Ordenado descendente
+            "class_percentages": class_percentages,  # Requerimiento: Nuevo campo
+            "detections": final_detections
+        })
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error en predicción: {str(e)}")
-
-
-@app.get("/health")
-async def health_check():
-    """Verificar que el servidor y modelo están funcionando"""
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None
-    }
-
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500, 
+            content={"success": False, "error": str(e)}
+        )
 
 if __name__ == "__main__":
-    import uvicorn
+    # Ejecución directa para pruebas
     uvicorn.run(app, host="0.0.0.0", port=8000)
