@@ -1,148 +1,126 @@
 import cv2
 import numpy as np
-import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 from ultralytics import YOLO
-from collections import Counter
+import uvicorn
 from typing import List, Dict, Any
 
-app = FastAPI(title="Coffee Bean Detection API (OpenCV Optimized)")
+app = FastAPI(title="API Detección Café - OpenCV Optimized & Retina")
 
-# ---------------------------------------------------------
-# CONFIGURACIÓN GLOBAL
-# ---------------------------------------------------------
-MODEL_PATH = "best.pt"  # Asegúrate de que este archivo exista en el directorio
+# --- 0. CONFIGURACIÓN ---
+CONF_THRESHOLD = 0.10       # Umbral mínimo de confianza
+IOU_BBOX_THRESHOLD = 0.5    # NMS interno de YOLO (Cajas)
+MASK_IOU_THRESHOLD = 0.1    # NMS personalizado (Máscaras)
+
+# Cargar modelo
 try:
-    # Cargamos el modelo al iniciar
-    model = YOLO(MODEL_PATH)
+    model = YOLO('best.pt')
+    print("✅ Modelo YOLOv8 cargado exitosamente (Modo OpenCV + Retina Masks).")
 except Exception as e:
-    print(f"ERROR CRÍTICO: No se pudo cargar el modelo en {MODEL_PATH}. {e}")
+    print(f"❌ Error crítico cargando el modelo: {e}")
     model = None
 
-# Umbrales definidos en los requerimientos
-CONF_THRESHOLD = 0.10
-IOU_BOX_THRESHOLD = 0.5
-IOU_MASK_THRESHOLD = 0.1
-
-# ---------------------------------------------------------
-# UTILIDADES DE FILTRADO (NMS & IOU)
-# ---------------------------------------------------------
-
-def calculate_mask_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
-    """
-    Calcula la Intersección sobre Unión (IoU) de dos máscaras binarias.
-    """
-    intersection = np.logical_and(mask1, mask2).sum()
-    union = np.logical_or(mask1, mask2).sum()
-    if union == 0:
-        return 0.0
-    return intersection / union
+# --- 1. FUNCIONES DE FILTRADO OPTIMIZADAS ---
 
 def polygon_to_mask(polygon, img_shape):
-    """
-    Convierte coordenadas de polígono a una máscara binaria (bitmap).
-    """
+    """Convierte coordenadas de polígono a una máscara binaria (bitmap)."""
     mask = np.zeros(img_shape[:2], dtype=np.uint8)
-    # Convertir polígono a formato entero para cv2.fillPoly
     pts = np.array(polygon, dtype=np.int32)
     cv2.fillPoly(mask, [pts], 1)
     return mask.astype(bool)
 
+def calculate_mask_iou_optimized(mask1_bool, mask2_bool):
+    """Calcula IoU usando operaciones booleanas (mucho más rápido)."""
+    intersection = np.logical_and(mask1_bool, mask2_bool).sum()
+    union = np.logical_or(mask1_bool, mask2_bool).sum()
+    if union == 0: return 0.0
+    return intersection / union
+
 def apply_mask_nms(detections: List[Dict], iou_thresh: float, img_shape: tuple) -> List[Dict]:
     """
-    Aplica Non-Maximum Suppression basado en la superposición de Máscaras.
-    Prioriza detecciones con mayor confianza.
+    NMS basado en máscaras con caché para alto rendimiento.
     """
-    if not detections:
-        return []
+    if not detections: return []
 
-    # Ordenar por confianza descendente
+    # Ordenar por confianza descendente (primero los más seguros)
     detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
     keep = []
     
-    # Cache de máscaras binarias para evitar regenerarlas
+    # Caché de máscaras binarias para no redibujar polígonos (Optimización Clave)
     mask_cache = {}
 
     for i, current_det in enumerate(detections):
-        current_poly = current_det['polygon']
+        # Si ya decidimos descartar este índice en una iteración anterior, saltar
+        # (Nota: en esta implementación simple de NMS iterativo, 'detections' es la lista fuente)
         
-        # Generar o recuperar máscara
+        # Generar máscara del actual
         if i not in mask_cache:
-            mask_cache[i] = polygon_to_mask(current_poly, img_shape)
+            mask_cache[i] = polygon_to_mask(current_det['polygon'], img_shape)
         
         curr_mask = mask_cache[i]
         should_keep = True
 
-        for j in keep:
-            # Recuperar máscara de la detección ya aceptada
-            prev_mask = mask_cache[j['original_index']]
+        # Comparar contra los que ya aceptamos
+        for kept_item in keep:
+            kept_idx = kept_item['original_index']
+            prev_mask = mask_cache[kept_idx]
             
-            # Calcular IoU
-            iou = calculate_mask_iou(curr_mask, prev_mask)
+            iou = calculate_mask_iou_optimized(curr_mask, prev_mask)
             
             if iou > iou_thresh:
                 should_keep = False
                 break
         
         if should_keep:
-            # Guardamos el índice original para referencia en caché
-            current_det['original_index'] = i
+            current_det['original_index'] = i # Guardamos índice para referencia del caché
             keep.append(current_det)
 
-    # Limpiar campo temporal
+    # Limpiar datos temporales antes de enviar al frontend
     for item in keep:
-        del item['original_index']
-        
+        if 'original_index' in item:
+            del item['original_index']
+            
     return keep
 
-# ---------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------
+# --- 2. ENDPOINT ---
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if model is None:
-        raise HTTPException(status_code=500, detail="Modelo no cargado.")
+        raise HTTPException(status_code=500, detail="El modelo no está cargado.")
 
     try:
-        # 1. CAMBIO A OPENCV PURO (Lectura de bytes directa)
+        # A. Leer imagen como bytes y decodificar con OpenCV (BGR)
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
-        
-        # Decodificar directamente a BGR (OpenCV default)
-        # Esto es CRÍTICO para coincidir con el entrenamiento si se usó cv2
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if img is None:
-            raise HTTPException(status_code=400, detail="El archivo no es una imagen válida.")
+            raise HTTPException(status_code=400, detail="Imagen corrupta o formato no soportado.")
 
         height, width = img.shape[:2]
 
-        # 2. INFERENCIA
-        # Ultralytics maneja la conversión interna, pero al pasar numpy BGR,
-        # respetará los canales si el modelo fue entrenado así o estandarizado.
+        # B. Inferencia con Retina Masks (Mayor precisión en bordes)
         results = model.predict(
             source=img, 
             conf=CONF_THRESHOLD, 
-            iou=IOU_BOX_THRESHOLD,
-            retina_masks=True # Mejora la calidad de los polígonos
+            iou=IOU_BBOX_THRESHOLD,
+            retina_masks=True,  # <--- MEJORA: Máscaras de alta definición
+            verbose=False
         )[0]
 
         raw_detections = []
 
-        # Verificar si hay máscaras detectadas
+        # C. Extracción de datos
         if results.masks is not None:
-            # Extraer datos
-            # results.masks.xy devuelve una lista de arrays con coordenadas de polígonos
+            # masks.xy devuelve coordenadas ajustadas al tamaño original de la imagen
             polygons = results.masks.xy 
             boxes = results.boxes
             names = results.names
 
             for i, poly in enumerate(polygons):
-                # Si el polígono está vacío o muy pequeño, saltar
-                if len(poly) < 3: 
-                    continue
+                # Filtrar polígonos degenerados (menos de 3 puntos)
+                if len(poly) < 3: continue
 
                 cls_id = int(boxes.cls[i].item())
                 conf = float(boxes.conf[i].item())
@@ -151,49 +129,44 @@ async def predict(file: UploadFile = File(...)):
                 raw_detections.append({
                     "class": label,
                     "confidence": round(conf, 4),
-                    "polygon": poly.tolist() # Convertir numpy array a lista para JSON
+                    "polygon": poly.tolist() # Numpy a Lista
                 })
 
-        # 3. FILTRADO (Mask NMS)
-        # Mantenemos la lógica de filtrar duplicados que se solapan físicamente
-        final_detections = apply_mask_nms(raw_detections, IOU_MASK_THRESHOLD, (height, width))
+        # D. NMS de Máscaras (Eliminar duplicados solapados)
+        final_detections = apply_mask_nms(raw_detections, MASK_IOU_THRESHOLD, (height, width))
 
-        # 4. CÁLCULO DE ESTADÍSTICAS MEJORADAS
-        total_count = len(final_detections)
-        avg_conf = 0.0
+        # E. Cálculo de Estadísticas (Formato amigable para Flutter)
+        class_counts = {}
+        total_detections = len(final_detections)
         
-        # Conteo de clases
-        class_counts_raw = Counter(d['class'] for d in final_detections)
-        
-        # Ordenar conteos de MAYOR a MENOR
-        sorted_class_counts = dict(sorted(class_counts_raw.items(), key=lambda item: item[1], reverse=True))
+        for det in final_detections:
+            c_name = det['class']
+            class_counts[c_name] = class_counts.get(c_name, 0) + 1
 
-        # Calcular porcentajes ordenados
-        class_percentages = {}
-        if total_count > 0:
-            avg_conf = sum(d['confidence'] for d in final_detections) / total_count
-            for cls_name, count in sorted_class_counts.items():
-                percent = (count / total_count) * 100
-                class_percentages[cls_name] = f"{percent:.1f}%"
+        # Ordenar estadísticas de mayor a menor cantidad
+        summary_list = []
+        sorted_counts = sorted(class_counts.items(), key=lambda item: item[1], reverse=True)
 
-        # 5. RESPUESTA JSON
-        return JSONResponse(content={
-            "success": True,
-            "total_detections": total_count,
-            "avg_confidence": round(avg_conf, 4),
-            "class_counts": sorted_class_counts,     # Requerimiento: Ordenado descendente
-            "class_percentages": class_percentages,  # Requerimiento: Nuevo campo
-            "detections": final_detections
-        })
+        for name, count in sorted_counts:
+            percentage = (count / total_detections * 100) if total_detections > 0 else 0
+            summary_list.append({
+                "class_name": name,         # Ej: "maduro"
+                "count": count,             # Ej: 15
+                "percentage": round(percentage, 1) # Ej: 45.5
+            })
+
+        # F. Respuesta JSON Final
+        return {
+            "status": "success",
+            "total_detections": total_detections,
+            "summary": summary_list,      # Ideal para ListView en Flutter
+            "detections": final_detections # Polígonos para CustomPainter
+        }
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500, 
-            content={"success": False, "error": str(e)}
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Ejecución directa para pruebas
     uvicorn.run(app, host="0.0.0.0", port=8000)
