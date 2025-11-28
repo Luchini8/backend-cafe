@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse # Importamos esto para errores personalizados
 from ultralytics import YOLO
 import uvicorn
 from typing import List, Dict, Any
@@ -8,7 +9,7 @@ from typing import List, Dict, Any
 app = FastAPI(title="API Detección Café - OpenCV Optimized & Retina")
 
 # --- 0. CONFIGURACIÓN ---
-CONF_THRESHOLD = 0.10       # Umbral mínimo de confianza
+CONF_THRESHOLD = 0.30       # Umbral mínimo de confianza
 IOU_BBOX_THRESHOLD = 0.5    # NMS interno de YOLO (Cajas)
 MASK_IOU_THRESHOLD = 0.1    # NMS personalizado (Máscaras)
 
@@ -42,25 +43,18 @@ def apply_mask_nms(detections: List[Dict], iou_thresh: float, img_shape: tuple) 
     """
     if not detections: return []
 
-    # Ordenar por confianza descendente (primero los más seguros)
     detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
     keep = []
     
-    # Caché de máscaras binarias para no redibujar polígonos (Optimización Clave)
     mask_cache = {}
 
     for i, current_det in enumerate(detections):
-        # Si ya decidimos descartar este índice en una iteración anterior, saltar
-        # (Nota: en esta implementación simple de NMS iterativo, 'detections' es la lista fuente)
-        
-        # Generar máscara del actual
         if i not in mask_cache:
             mask_cache[i] = polygon_to_mask(current_det['polygon'], img_shape)
         
         curr_mask = mask_cache[i]
         should_keep = True
 
-        # Comparar contra los que ya aceptamos
         for kept_item in keep:
             kept_idx = kept_item['original_index']
             prev_mask = mask_cache[kept_idx]
@@ -72,10 +66,9 @@ def apply_mask_nms(detections: List[Dict], iou_thresh: float, img_shape: tuple) 
                 break
         
         if should_keep:
-            current_det['original_index'] = i # Guardamos índice para referencia del caché
+            current_det['original_index'] = i
             keep.append(current_det)
 
-    # Limpiar datos temporales antes de enviar al frontend
     for item in keep:
         if 'original_index' in item:
             del item['original_index']
@@ -87,39 +80,43 @@ def apply_mask_nms(detections: List[Dict], iou_thresh: float, img_shape: tuple) 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if model is None:
-        raise HTTPException(status_code=500, detail="El modelo no está cargado.")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": "El modelo no está cargado en el servidor."}
+        )
 
     try:
-        # A. Leer imagen como bytes y decodificar con OpenCV (BGR)
+        # A. Leer imagen
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
-            raise HTTPException(status_code=400, detail="Imagen corrupta o formato no soportado.")
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Imagen corrupta o formato no soportado."}
+            )
 
         height, width = img.shape[:2]
 
-        # B. Inferencia con Retina Masks (Mayor precisión en bordes)
+        # B. Inferencia
         results = model.predict(
             source=img, 
             conf=CONF_THRESHOLD, 
             iou=IOU_BBOX_THRESHOLD,
-            retina_masks=True,  # <--- MEJORA: Máscaras de alta definición
+            retina_masks=True,
             verbose=False
         )[0]
 
         raw_detections = []
 
-        # C. Extracción de datos
+        # C. Extracción
         if results.masks is not None:
-            # masks.xy devuelve coordenadas ajustadas al tamaño original de la imagen
             polygons = results.masks.xy 
             boxes = results.boxes
             names = results.names
 
             for i, poly in enumerate(polygons):
-                # Filtrar polígonos degenerados (menos de 3 puntos)
                 if len(poly) < 3: continue
 
                 cls_id = int(boxes.cls[i].item())
@@ -129,13 +126,13 @@ async def predict(file: UploadFile = File(...)):
                 raw_detections.append({
                     "class": label,
                     "confidence": round(conf, 4),
-                    "polygon": poly.tolist() # Numpy a Lista
+                    "polygon": poly.tolist()
                 })
 
-        # D. NMS de Máscaras (Eliminar duplicados solapados)
+        # D. NMS Máscaras
         final_detections = apply_mask_nms(raw_detections, MASK_IOU_THRESHOLD, (height, width))
 
-        # E. Cálculo de Estadísticas (Formato amigable para Flutter)
+        # E. Estadísticas
         class_counts = {}
         total_detections = len(final_detections)
         
@@ -143,30 +140,34 @@ async def predict(file: UploadFile = File(...)):
             c_name = det['class']
             class_counts[c_name] = class_counts.get(c_name, 0) + 1
 
-        # Ordenar estadísticas de mayor a menor cantidad
         summary_list = []
         sorted_counts = sorted(class_counts.items(), key=lambda item: item[1], reverse=True)
 
         for name, count in sorted_counts:
             percentage = (count / total_detections * 100) if total_detections > 0 else 0
             summary_list.append({
-                "class_name": name,         # Ej: "maduro"
-                "count": count,             # Ej: 15
-                "percentage": round(percentage, 1) # Ej: 45.5
+                "class_name": name,
+                "count": count,
+                "percentage": round(percentage, 1)
             })
 
-        # F. Respuesta JSON Final
+        # F. Respuesta JSON (CORREGIDA)
         return {
-            "status": "success",
+            "success": True,              # <--- ¡IMPORTANTE! Esto faltaba
+            "status": "success",          # Mantenemos ambos por compatibilidad
             "total_detections": total_detections,
-            "summary": summary_list,      # Ideal para ListView en Flutter
-            "detections": final_detections # Polígonos para CustomPainter
+            "summary": summary_list,      
+            "detections": final_detections
         }
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        # Devolvemos un JSON con success: False en caso de error
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
